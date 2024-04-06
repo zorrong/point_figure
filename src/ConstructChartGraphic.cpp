@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <memory>
 #include <ranges>
 
@@ -41,7 +43,7 @@ namespace vws = std::ranges::views;
 
 // NOLINTBEGIN
 constexpr auto RED = 0xFF0000;     // for down columns
-constexpr auto BLACK = 0x000000;    // for down columns
+constexpr auto BLACK = 0x000000;   // for down columns
 constexpr auto GREEN = 0x008000;   // for up columns
 constexpr auto YELLOW = 0xFFFF00;  // for up columns
 constexpr auto BLUE = 0x0000FF;    // for reversed to up columns
@@ -280,7 +282,8 @@ void ConstructCDPFChartGraphicAndWriteToFile(const PF_Chart& the_chart, const fs
     c->addLegend(k50, 90, false, "Times New Roman Bold Italic", k12)->setBackground(Chart::Transparent);
 
     c->xAxis()->setLabels(StringArray(x_axis_label_data.data(), x_axis_label_data.size()))->setFontAngle(45.);
-    c->xAxis()->setLabelStep(static_cast<int32_t>((columns_in_PF_Chart - skipped_columns) / k40), 0);
+
+    c->xAxis()->setLabelStep(k40, 0);
     c->yAxis()->setLabelStyle("Arial Bold");
     if (the_chart.IsPercent())
     {
@@ -326,6 +329,12 @@ void ConstructCDPFChartGraphicAndWriteToFile(const PF_Chart& the_chart, const fs
     const auto dash_color = c->dashLineColor(RED, Chart::DashLine);
     c->yAxis()->addMark(dec2dbl(first_value), dash_color)->setLineWidth(3);
 
+    // add a point to keep our mark line in view
+
+    double mark_marker = dec2dbl(first_value);
+    double mark_col = 0.0;
+    c->addScatterLayer(DoubleArray(&mark_col, 1), DoubleArray(&mark_marker, 1));
+
     Signals_2 data_for_prices;
 
     std::unique_ptr<XYChart> p;
@@ -337,27 +346,40 @@ void ConstructCDPFChartGraphicAndWriteToFile(const PF_Chart& the_chart, const fs
 
     if (!streamed_prices.price_.empty())
     {
+        // We get a LOT of data from Eodhd so we need to limit how much we show on the graphic
+        // for transaction data.
+        // For now, just limit the max number of points to the most recent 'n' where
+        // 'n' = the width of the chart.
+
+        const auto max_price_cols = static_cast<size_t>(kChartWidth * kDpi - k120 - k50) * 2;
+        size_t skipped_price_cols = 0;
+        if (streamed_prices.timestamp_.size() > max_price_cols)
+        {
+            skipped_price_cols = streamed_prices.timestamp_.size() - max_price_cols;
+        }
         // for x-axis label, we use the time in nanoseconds from the
         // streamed data.
         // the chart software wants an array of const char*.
         // this will take several steps.
 
-        p_x_axis_labels.reserve(streamed_prices.timestamp_.size());
+        p_x_axis_labels.reserve(streamed_prices.timestamp_.size() - skipped_price_cols);
 
-        for (const auto& nanosecs : streamed_prices.timestamp_)
-        {
-            if (date_or_time == PF_Chart::X_AxisFormat::e_show_date)
-            {
-                p_x_axis_labels.emplace_back(std::format("{:%F}", PF_Column::TmPt{std::chrono::nanoseconds{nanosecs}}));
-            }
-            else
-            {
-                p_x_axis_labels.emplace_back(
-                    UTCTimePointToLocalTZHMSString(PF_Column::TmPt{std::chrono::nanoseconds{nanosecs}}));
-            }
-        }
+        rng::for_each(streamed_prices.timestamp_ | vws::drop(skipped_price_cols),
+                      [&p_x_axis_labels, &date_or_time](const auto& nanosecs)
+                      {
+                          if (date_or_time == PF_Chart::X_AxisFormat::e_show_date)
+                          {
+                              p_x_axis_labels.emplace_back(
+                                  std::format("{:%F}", PF_Column::TmPt{std::chrono::nanoseconds{nanosecs}}));
+                          }
+                          else
+                          {
+                              p_x_axis_labels.emplace_back(
+                                  UTCTimePointToLocalTZHMSString(PF_Column::TmPt{std::chrono::nanoseconds{nanosecs}}));
+                          }
+                      });
 
-        p_x_axis_label_data.reserve(streamed_prices.timestamp_.size());
+        p_x_axis_label_data.reserve(p_x_axis_labels.size());
         rng::for_each(p_x_axis_labels,
                       [&p_x_axis_label_data](const auto& label) { p_x_axis_label_data.push_back(label.c_str()); });
 
@@ -367,25 +389,42 @@ void ConstructCDPFChartGraphicAndWriteToFile(const PF_Chart& the_chart, const fs
             throw std::runtime_error("Unable to create streamed prices graphic.");
         }
 
-        p->setPlotArea(k50, k50, (kChartWidth * kDpi - k80), (kChartHeight3 * kDpi - k200))
+        p->setPlotArea(k50, k50, (kChartWidth * kDpi - k120), (kChartHeight3 * kDpi - k200))
             ->setGridColor(LITEGRAY, LITEGRAY);
 
-        p->addTitle("Price data for PF_Chart");
+        p->addTitle(std::format("Price data for {} {}", the_chart.GetSymbol(),
+                                (skipped_price_cols == 0 ? "" : std::format("Showing last {} cols", max_price_cols)))
+                        .c_str());
 
         p->addLegend(k50, 40, false, "Times New Roman Bold Italic", 12)->setBackground(Chart::Transparent);
 
-        p->addLineLayer(DoubleArray(streamed_prices.price_.data(), streamed_prices.price_.size()), RED);
+        // trim our data by bumping pointer and adjusting counter
+
+        p->addLineLayer(DoubleArray(streamed_prices.price_.data() + skipped_price_cols,
+                                    streamed_prices.price_.size() - skipped_price_cols),
+                        RED);
 
         p->xAxis()->setLabels(StringArray(p_x_axis_label_data.data(), p_x_axis_label_data.size()))->setFontAngle(45.);
-        p->xAxis()->setLabelStep(static_cast<int32_t>((p_x_axis_label_data.size()) / 40), 0);
+
+        p->xAxis()->setLabelStep(k40, 0);
         p->yAxis()->setLabelStyle("Arial Bold");
 
         p->yAxis2()->copyAxis(p->yAxis());
 
+        // let's show where we started from
+
+        const auto dash_color = p->dashLineColor(RED, Chart::DashLine);
+        p->yAxis()->addMark(dec2dbl(first_value), dash_color)->setLineWidth(2);
+        // add a point to keep our mark line in view
+
+        double mark_marker = dec2dbl(first_value);
+        double mark_col = 0.0;
+        p->addScatterLayer(DoubleArray(&mark_col, 1), DoubleArray(&mark_marker, 1));
+
         // next, add our signals to this graphic.
         // Each signal type will be a separate layer so it can have its own glyph and color.
 
-        ConstructCDPricesGraphicAddSignals(the_chart, data_for_prices, streamed_prices, p);
+        ConstructCDPricesGraphicAddSignals(the_chart, data_for_prices, skipped_price_cols, streamed_prices, p);
     }
 
     if (!p)
@@ -544,53 +583,53 @@ void ConstructCDPFChartGraphicAddPFSignals(const PF_Chart& the_chart, Signals_1&
     }
 }
 
-void ConstructCDPricesGraphicAddSignals(const PF_Chart& the_chart, Signals_2& data_arrays,
+void ConstructCDPricesGraphicAddSignals(const PF_Chart& the_chart, Signals_2& data_arrays, size_t skipped_price_cols,
                                         const StreamedPrices& streamed_prices, std::unique_ptr<XYChart>& the_graphic)
 {
-    for (int32_t ndx = 0; ndx < streamed_prices.signal_type_.size(); ++ndx)
+    for (int32_t ndx = 0 + skipped_price_cols; ndx < streamed_prices.signal_type_.size(); ++ndx)
     {
         switch (streamed_prices.signal_type_[ndx])
         {
             using enum PF_SignalType;
             case std::to_underlying(e_double_top_buy):
                 data_arrays.dt_buys_price_.emplace_back(streamed_prices.price_[ndx]);
-                data_arrays.dt_buys_x_.emplace_back(ndx);
+                data_arrays.dt_buys_x_.emplace_back(ndx - skipped_price_cols);
                 break;
             case std::to_underlying(e_double_bottom_sell):
                 data_arrays.db_sells_price_.emplace_back(streamed_prices.price_[ndx]);
-                data_arrays.db_sells_x_.emplace_back(ndx);
+                data_arrays.db_sells_x_.emplace_back(ndx - skipped_price_cols);
                 break;
             case std::to_underlying(e_triple_top_buy):
                 data_arrays.tt_buys_price_.emplace_back(streamed_prices.price_[ndx]);
-                data_arrays.tt_buys_x_.emplace_back(ndx);
+                data_arrays.tt_buys_x_.emplace_back(ndx - skipped_price_cols);
                 break;
             case std::to_underlying(e_triple_bottom_sell):
                 data_arrays.tb_sells_price_.emplace_back(streamed_prices.price_[ndx]);
-                data_arrays.tb_sells_x_.emplace_back(ndx);
+                data_arrays.tb_sells_x_.emplace_back(ndx - skipped_price_cols);
                 break;
             case std::to_underlying(e_bullish_tt_buy):
                 data_arrays.bullish_tt_buys_price_.emplace_back(streamed_prices.price_[ndx]);
-                data_arrays.bullish_tt_buys_x_.emplace_back(ndx);
+                data_arrays.bullish_tt_buys_x_.emplace_back(ndx - skipped_price_cols);
                 break;
             case std::to_underlying(e_bearish_tb_sell):
                 data_arrays.bearish_tb_sells_price_.emplace_back(streamed_prices.price_[ndx]);
-                data_arrays.bearish_tb_sells_x_.emplace_back(ndx);
+                data_arrays.bearish_tb_sells_x_.emplace_back(ndx - skipped_price_cols);
                 break;
             case std::to_underlying(e_catapult_buy):
                 data_arrays.cat_buys_price_.emplace_back(streamed_prices.price_[ndx]);
-                data_arrays.cat_buys_x_.emplace_back(ndx);
+                data_arrays.cat_buys_x_.emplace_back(ndx - skipped_price_cols);
                 break;
             case std::to_underlying(e_catapult_sell):
                 data_arrays.cat_sells_price_.emplace_back(streamed_prices.price_[ndx]);
-                data_arrays.cat_sells_x_.emplace_back(ndx);
+                data_arrays.cat_sells_x_.emplace_back(ndx - skipped_price_cols);
                 break;
             case std::to_underlying(e_ttop_catapult_buy):
                 data_arrays.tt_cat_buys_price_.emplace_back(streamed_prices.price_[ndx]);
-                data_arrays.tt_cat_buys_x_.emplace_back(ndx);
+                data_arrays.tt_cat_buys_x_.emplace_back(ndx - skipped_price_cols);
                 break;
             case std::to_underlying(e_tbottom_catapult_sell):
                 data_arrays.tb_cat_sells_price_.emplace_back(streamed_prices.price_[ndx]);
-                data_arrays.tb_cat_sells_x_.emplace_back(ndx);
+                data_arrays.tb_cat_sells_x_.emplace_back(ndx - skipped_price_cols);
                 break;
             case std::to_underlying(e_unknown):
             default:
@@ -624,9 +663,10 @@ void ConstructCDPricesGraphicAddSignals(const PF_Chart& the_chart, Signals_2& da
 
     if (!data_arrays.tb_sells_price_.empty())
     {
-        the_graphic->addScatterLayer(DoubleArray(data_arrays.tb_sells_x_.data(), data_arrays.tb_sells_x_.size()),
-                                     DoubleArray(data_arrays.tb_sells_price_.data(), data_arrays.tb_sells_price_.size()),
-                                     "tb sell", tb_sell_sym, k13, BLACK);
+        the_graphic->addScatterLayer(
+            DoubleArray(data_arrays.tb_sells_x_.data(), data_arrays.tb_sells_x_.size()),
+            DoubleArray(data_arrays.tb_sells_price_.data(), data_arrays.tb_sells_price_.size()), "tb sell", tb_sell_sym,
+            k13, BLACK);
     }
 
     if (!data_arrays.bullish_tt_buys_price_.empty())
